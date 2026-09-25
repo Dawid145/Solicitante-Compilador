@@ -358,7 +358,162 @@ async function subirArchivoGitHub(
 // ============================================================
 // EJECUTAR GITHUB ACTION
 // ============================================================
+// ============================================================
+// CREAR WORKFLOW AUTOMÁTICAMENTE
+// ============================================================
 
+async function crearWorkflowCompilador(
+  owner,
+  repo,
+  branch
+) {
+
+  const rutaWorkflow =
+    ".github/workflows/compilar.yml";
+
+
+  const workflow = `name: Compilar proyecto
+
+on:
+  workflow_dispatch:
+
+jobs:
+  preparar:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Descargar proyecto
+        uses: actions/checkout@v4
+
+      - name: Mostrar archivos recibidos
+        run: |
+          echo "================================"
+          echo "SOLICITANTE-COMPILADOR"
+          echo "================================"
+          echo "Proyecto recibido correctamente."
+          echo ""
+          echo "Archivos del proyecto:"
+          find . -maxdepth 5 -type f \\
+            ! -path "./.git/*"
+          echo ""
+          echo "================================"
+
+      - name: Crear resultado de prueba
+        run: |
+          echo "Compilación de prueba ejecutada correctamente." > resultado.txt
+          echo "Repositorio: $GITHUB_REPOSITORY" >> resultado.txt
+          echo "Commit: $GITHUB_SHA" >> resultado.txt
+
+      - name: Guardar resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-compilacion
+          path: resultado.txt
+          retention-days: 7
+`;
+
+
+  const contenido =
+    Buffer.from(workflow)
+      .toString("base64");
+
+
+  const url =
+    \`https://api.github.com/repos/\` +
+    \`\${encodeURIComponent(owner)}/\` +
+    \`\${encodeURIComponent(repo)}/contents/\` +
+    \`.github/workflows/compilar.yml\`;
+
+
+  /*
+   * Comprobamos si el workflow ya existe.
+   */
+
+  const comprobar =
+    await githubRequest(
+      \`\${url}?ref=\${encodeURIComponent(branch)}\`
+    );
+
+
+  let sha;
+
+
+  if (comprobar.status === 200) {
+
+    const existente =
+      await comprobar.json();
+
+    sha = existente.sha;
+  }
+
+
+  const cuerpo = {
+
+    message:
+      "Configurar workflow del compilador",
+
+    content:
+      contenido,
+
+    branch
+  };
+
+
+  /*
+   * Si ya existe, GitHub exige su SHA
+   * para actualizarlo.
+   */
+
+  if (sha) {
+    cuerpo.sha = sha;
+  }
+
+
+  const respuesta =
+    await githubRequest(
+      url,
+      {
+        method: "PUT",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify(cuerpo)
+      }
+    );
+
+
+  const datos =
+    await respuesta.json();
+
+
+  if (!respuesta.ok) {
+
+    if (
+      respuesta.status === 403
+    ) {
+
+      throw new Error(
+        "GitHub rechazó la creación del workflow. " +
+        "El PAT probablemente necesita el alcance " +
+        "'workflow'."
+      );
+    }
+
+
+    throw new Error(
+      datos.message ||
+      "No se pudo crear compilar.yml."
+    );
+  }
+
+
+  return datos;
+}
 async function ejecutarAction(
   owner,
   repo,
