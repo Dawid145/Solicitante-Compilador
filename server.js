@@ -1183,7 +1183,15 @@ const server = http.createServer(
             const branch =
               repositorio.default_branch ||
               "main";
+            // =================================================
+// CREAR / ACTUALIZAR WORKFLOW
+// =================================================
 
+await crearWorkflowCompilador(
+  owner,
+  repositorio.name,
+  branch
+);
 
             // =================================================
             // SUBIR ARCHIVOS
