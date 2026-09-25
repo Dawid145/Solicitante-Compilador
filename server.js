@@ -5,452 +5,588 @@ const path = require("path");
 const PORT = process.env.PORT || 3000;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
-const server = http.createServer((req, res) => {
+// Nombre del workflow que queremos ejecutar.
+// Podés cambiarlo después desde Render mediante una variable de entorno.
+const COMPILER_WORKFLOW =
+  process.env.COMPILER_WORKFLOW || "compilar.yml";
 
-  // Página principal
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8"
-    });
 
-    res.end(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Solicitante Compilador</title>
-        </head>
+// ============================================================
+// UTILIDADES
+// ============================================================
 
-        <body>
-          <h1>Solicitante Compilador</h1>
+function responderHTML(res, codigo, html) {
+  res.writeHead(codigo, {
+    "Content-Type": "text/html; charset=utf-8"
+  });
 
-          <h2>GitHub</h2>
+  res.end(html);
+}
 
-          <p>
-            <a href="/github/test">
-              <button>Probar conexión con GitHub</button>
-            </a>
-          </p>
 
-          <hr>
+async function githubRequest(url, opciones = {}) {
 
-          <h2>Subir un archivo</h2>
-
-          <form action="/upload" method="POST" enctype="multipart/form-data">
-            <input
-  type="file"
-  name="archivo"
-  multiple
-  webkitdirectory
-  directory
->
-            <br><br>
-            <button type="submit">Enviar archivo</button>
-          </form>
-
-        </body>
-      </html>
-    `);
-
-    return;
+  if (!GITHUB_TOKEN) {
+    throw new Error(
+      "GITHUB_TOKEN no está configurado en Render."
+    );
   }
 
-  // Comprobar conexión con GitHub
-  if (req.method === "GET" && req.url === "/github/test") {
+  return fetch(url, {
+    ...opciones,
 
-    if (!GITHUB_TOKEN) {
-      res.writeHead(500, {
-        "Content-Type": "text/plain; charset=utf-8"
-      });
+    headers: {
+      "Authorization": `Bearer ${GITHUB_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2026-03-10",
+      "User-Agent": "Solicitante-Compilador",
 
-      res.end("ERROR: GITHUB_TOKEN no está configurado en Render.");
-      return;
+      ...(opciones.headers || {})
     }
+  });
+}
 
-    fetch("https://api.github.com/user", {
-      headers: {
-        "Authorization": `Bearer ${GITHUB_TOKEN}`,
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "Solicitante-Compilador"
+
+// ============================================================
+// OBTENER USUARIO DE GITHUB
+// ============================================================
+
+async function obtenerUsuarioGitHub() {
+
+  const respuesta = await githubRequest(
+    "https://api.github.com/user"
+  );
+
+  const datos = await respuesta.json();
+
+  if (!respuesta.ok) {
+
+    throw new Error(
+      datos.message ||
+      "No se pudo obtener el usuario de GitHub."
+    );
+  }
+
+  return datos;
+}
+
+
+// ============================================================
+// LIMPIAR NOMBRE DEL REPOSITORIO
+// ============================================================
+
+function prepararNombreRepositorio(nombre) {
+
+  let resultado = nombre
+    .trim()
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  if (!resultado) {
+    resultado = "proyecto";
+  }
+
+  return resultado;
+}
+
+
+// ============================================================
+// OBTENER NOMBRE DEL PROYECTO
+// ============================================================
+
+function obtenerNombreProyecto(archivos) {
+
+  if (archivos.length === 0) {
+    return "proyecto";
+  }
+
+  const primeraRuta = archivos[0].ruta;
+
+  const segmentos = primeraRuta
+    .split("/")
+    .filter(Boolean);
+
+  /*
+   * Si seleccionamos una carpeta completa:
+   *
+   * MiApp/index.html
+   *
+   * usamos:
+   *
+   * MiApp
+   */
+
+  if (segmentos.length > 1) {
+    return prepararNombreRepositorio(
+      segmentos[0]
+    );
+  }
+
+  /*
+   * Si se seleccionó un archivo individual:
+   *
+   * app.js
+   *
+   * usamos:
+   *
+   * app
+   */
+
+  return prepararNombreRepositorio(
+    path.basename(
+      segmentos[0],
+      path.extname(segmentos[0])
+    )
+  );
+}
+
+
+// ============================================================
+// COMPROBAR / CREAR REPOSITORIO
+// ============================================================
+
+async function obtenerOCrearRepositorio(
+  owner,
+  nombreRepositorio
+) {
+
+  const url =
+    `https://api.github.com/repos/` +
+    `${encodeURIComponent(owner)}/` +
+    `${encodeURIComponent(nombreRepositorio)}`;
+
+  const comprobar =
+    await githubRequest(url);
+
+  /*
+   * El repositorio ya existe.
+   */
+
+  if (comprobar.status === 200) {
+
+    const repo =
+      await comprobar.json();
+
+    return {
+      ...repo,
+      creadoAhora: false
+    };
+  }
+
+
+  /*
+   * Si GitHub devuelve algo distinto de 404,
+   * existe otro problema.
+   */
+
+  if (comprobar.status !== 404) {
+
+    const error =
+      await comprobar.json();
+
+    throw new Error(
+      error.message ||
+      `GitHub respondió ${comprobar.status}.`
+    );
+  }
+
+
+  /*
+   * No existe.
+   *
+   * Lo creamos.
+   *
+   * auto_init = true crea el primer commit
+   * y permite trabajar inmediatamente sobre
+   * la rama principal.
+   */
+
+  const crear =
+    await githubRequest(
+      "https://api.github.com/user/repos",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body: JSON.stringify({
+          name: nombreRepositorio,
+
+          private: true,
+
+          description:
+            "Proyecto administrado por Solicitante-Compilador",
+
+          auto_init: true
+        })
       }
-    })
-    .then(async (respuesta) => {
+    );
 
-      const datos = await respuesta.json();
+  const datos =
+    await crear.json();
 
-      if (!respuesta.ok) {
-        throw new Error(
-          datos.message || "GitHub rechazó la solicitud."
-        );
+  if (!crear.ok) {
+
+    throw new Error(
+      datos.message ||
+      "GitHub no permitió crear el repositorio."
+    );
+  }
+
+  return {
+    ...datos,
+    creadoAhora: true
+  };
+}
+
+
+// ============================================================
+// SUBIR UN ARCHIVO A GITHUB
+// ============================================================
+
+async function subirArchivoGitHub(
+  owner,
+  repo,
+  ruta,
+  contenido,
+  branch
+) {
+
+  const rutaGitHub =
+    ruta
+      .split(path.sep)
+      .join("/");
+
+  const url =
+    `https://api.github.com/repos/` +
+    `${encodeURIComponent(owner)}/` +
+    `${encodeURIComponent(repo)}/contents/` +
+    `${rutaGitHub
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+
+
+  /*
+   * Convertimos el archivo a Base64,
+   * que es el formato requerido por
+   * este endpoint de GitHub.
+   */
+
+  const contenidoBase64 =
+    contenido.toString("base64");
+
+
+  /*
+   * Comprobamos si el archivo ya existe.
+   *
+   * Si existe necesitamos su SHA para
+   * actualizarlo.
+   */
+
+  let sha = undefined;
+
+  const comprobar =
+    await githubRequest(
+      `${url}?ref=${encodeURIComponent(branch)}`
+    );
+
+
+  if (comprobar.status === 200) {
+
+    const existente =
+      await comprobar.json();
+
+    sha = existente.sha;
+  }
+
+
+  const cuerpo = {
+    message:
+      `Actualizar ${rutaGitHub}`,
+
+    content:
+      contenidoBase64,
+
+    branch
+  };
+
+
+  if (sha) {
+    cuerpo.sha = sha;
+  }
+
+
+  const respuesta =
+    await githubRequest(
+      url,
+      {
+        method: "PUT",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body:
+          JSON.stringify(cuerpo)
       }
+    );
 
-      res.writeHead(200, {
-        "Content-Type": "text/html; charset=utf-8"
-      });
 
-      res.end(`
+  const datos =
+    await respuesta.json();
+
+
+  if (!respuesta.ok) {
+
+    throw new Error(
+      datos.message ||
+      `No se pudo subir ${rutaGitHub}.`
+    );
+  }
+
+
+  return datos;
+}
+
+
+// ============================================================
+// EJECUTAR GITHUB ACTION
+// ============================================================
+
+async function ejecutarAction(
+  owner,
+  repo,
+  workflow,
+  branch
+) {
+
+  const url =
+    `https://api.github.com/repos/` +
+    `${encodeURIComponent(owner)}/` +
+    `${encodeURIComponent(repo)}/` +
+    `actions/workflows/` +
+    `${encodeURIComponent(workflow)}/dispatches`;
+
+
+  const respuesta =
+    await githubRequest(
+      url,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+
+        body: JSON.stringify({
+          ref: branch
+        })
+      }
+    );
+
+
+  /*
+   * GitHub responde 204 cuando el dispatch
+   * fue aceptado.
+   */
+
+  if (respuesta.status === 204) {
+
+    return {
+      ejecutada: true
+    };
+  }
+
+
+  const datos =
+    await respuesta.json()
+      .catch(() => ({}));
+
+
+  /*
+   * No hacemos fallar toda la subida si
+   * todavía no existe la Action.
+   */
+
+  return {
+    ejecutada: false,
+
+    mensaje:
+      datos.message ||
+      `GitHub respondió ${respuesta.status}.`
+  };
+}
+
+
+// ============================================================
+// PÁGINA PRINCIPAL
+// ============================================================
+
+const server = http.createServer(
+  async (req, res) => {
+
+    // ========================================================
+    // INICIO
+    // ========================================================
+
+    if (
+      req.method === "GET" &&
+      req.url === "/"
+    ) {
+
+      return responderHTML(
+        res,
+        200,
+        `
         <!DOCTYPE html>
+
         <html>
+
           <head>
+
             <meta charset="UTF-8">
-            <title>GitHub conectado</title>
+
+            <meta
+              name="viewport"
+              content="width=device-width, initial-scale=1"
+            >
+
+            <title>
+              Solicitante Compilador
+            </title>
+
           </head>
 
+
           <body>
-            <h1>Conexión con GitHub correcta</h1>
+
+            <h1>
+              Solicitante Compilador
+            </h1>
+
+
+            <h2>
+              GitHub
+            </h2>
+
 
             <p>
-              Usuario autenticado:
-              <strong>${datos.login}</strong>
+
+              <a href="/github/test">
+
+                <button>
+                  Probar conexión con GitHub
+                </button>
+
+              </a>
+
             </p>
 
-            <p>GitHub respondió correctamente a nuestro servidor.</p>
 
-            <br>
+            <hr>
 
-            <a href="/">Volver</a>
-          </body>
-        </html>
-      `);
 
-    })
-    .catch((error) => {
+            <h2>
+              Subir proyecto
+            </h2>
 
-      console.error("Error de GitHub:", error);
-
-      res.writeHead(500, {
-        "Content-Type": "text/html; charset=utf-8"
-      });
-
-      res.end(`
-        <h1>Error de conexión con GitHub</h1>
-        <p>${error.message}</p>
-        <br>
-        <a href="/">Volver</a>
-      `);
-    });
-
-    return;
-  }
-
-  // Recibir archivos y conservar carpetas
-  if (req.method === "POST" && req.url === "/upload") {
-
-    let datos = Buffer.alloc(0);
-
-    req.on("data", (chunk) => {
-      datos = Buffer.concat([datos, chunk]);
-    });
-
-    req.on("end", () => {
-
-      try {
-
-        const contentType = req.headers["content-type"];
-
-        if (
-          !contentType ||
-          !contentType.includes("multipart/form-data")
-        ) {
-          res.writeHead(400, {
-            "Content-Type": "text/plain; charset=utf-8"
-          });
-
-          res.end("Formato de archivo no válido.");
-          return;
-        }
-
-        const match = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/);
-
-        if (!match) {
-          res.writeHead(400, {
-            "Content-Type": "text/plain; charset=utf-8"
-          });
-
-          res.end("No se encontró el límite del formulario.");
-          return;
-        }
-
-        const boundary = "--" + (match[1] || match[2]);
-
-        /*
-         * Convertimos la solicitud en partes.
-         * Cada parte representa un archivo.
-         */
-        const partes = datos.toString("binary").split(boundary);
-
-        const carpetaUploads = path.join(
-          __dirname,
-          "uploads"
-        );
-
-        /*
-         * Creamos uploads si todavía no existe.
-         */
-        if (!fs.existsSync(carpetaUploads)) {
-          fs.mkdirSync(carpetaUploads, {
-            recursive: true
-          });
-        }
-
-        const archivosGuardados = [];
-
-        for (const parte of partes) {
-
-          /*
-           * Ignoramos partes que no contienen
-           * información de archivo.
-           */
-          if (!parte.includes("filename=")) {
-            continue;
-          }
-
-          const nombreMatch = parte.match(
-            /filename="([^"]*)"/
-          );
-
-          if (!nombreMatch) {
-            continue;
-          }
-
-          let nombreOriginal = nombreMatch[1];
-
-          if (!nombreOriginal) {
-            continue;
-          }
-
-          /*
-           * Los navegadores pueden enviar "\" para
-           * separar carpetas en Windows.
-           * Lo convertimos a "/".
-           */
-          nombreOriginal = nombreOriginal.replace(
-            /\\/g,
-            "/"
-          );
-
-          /*
-           * Eliminamos posibles barras iniciales.
-           */
-          nombreOriginal = nombreOriginal.replace(
-            /^\/+/,
-            ""
-          );
-
-          /*
-           * Separamos la ruta en carpetas.
-           *
-           * Ejemplo:
-           *
-           * MiApp/js/app.js
-           *
-           * se convierte en:
-           *
-           * ["MiApp", "js", "app.js"]
-           */
-          const segmentos = nombreOriginal
-            .split("/")
-            .filter(segmento =>
-              segmento &&
-              segmento !== "." &&
-              segmento !== ".."
-            );
-
-          if (segmentos.length === 0) {
-            continue;
-          }
-
-          /*
-           * Construimos la ruta de forma segura.
-           */
-          const rutaRelativa = path.join(
-            ...segmentos
-          );
-
-          const rutaArchivo = path.join(
-            carpetaUploads,
-            rutaRelativa
-          );
-
-          /*
-           * Comprobación de seguridad:
-           * el archivo debe permanecer dentro
-           * de uploads.
-           */
-          const rutaComprobacion = path.relative(
-            carpetaUploads,
-            rutaArchivo
-          );
-
-          if (
-            rutaComprobacion.startsWith("..") ||
-            path.isAbsolute(rutaComprobacion)
-          ) {
-            continue;
-          }
-
-          /*
-           * Creamos las subcarpetas necesarias.
-           *
-           * Ejemplo:
-           *
-           * uploads/MiApp/js/
-           */
-          fs.mkdirSync(
-            path.dirname(rutaArchivo),
-            {
-              recursive: true
-            }
-          );
-
-          /*
-           * Buscamos dónde terminan los encabezados
-           * del archivo.
-           */
-          const separacion = parte.indexOf(
-            "\r\n\r\n"
-          );
-
-          if (separacion === -1) {
-            continue;
-          }
-
-          /*
-           * Extraemos el contenido.
-           */
-          let contenido = parte.substring(
-            separacion + 4
-          );
-
-          /*
-           * Eliminamos los caracteres que agrega
-           * multipart al final de cada archivo.
-           */
-          contenido = contenido.replace(
-            /\r\n$/,
-            ""
-          );
-
-          /*
-           * Guardamos el archivo conservando
-           * su estructura de carpetas.
-           */
-          const bufferArchivo = Buffer.from(
-            contenido,
-            "binary"
-          );
-
-          fs.writeFileSync(
-            rutaArchivo,
-            bufferArchivo
-          );
-
-          archivosGuardados.push({
-            ruta: rutaRelativa,
-            tamaño: bufferArchivo.length
-          });
-        }
-
-        /*
-         * Si no encontramos ningún archivo.
-         */
-        if (archivosGuardados.length === 0) {
-
-          res.writeHead(400, {
-            "Content-Type": "text/html; charset=utf-8"
-          });
-
-          res.end(`
-            <h1>No se recibieron archivos</h1>
 
             <p>
-              El servidor no encontró archivos
-              válidos en la solicitud.
+              Podés seleccionar archivos o
+              una carpeta completa.
             </p>
 
-            <br>
 
-            <a href="/">Volver</a>
-          `);
+            <form
+              action="/upload"
+              method="POST"
+              enctype="multipart/form-data"
+            >
 
-          return;
-        }
+              <input
+                type="file"
+                name="archivo"
+                multiple
+                webkitdirectory
+                directory
+              >
 
-        /*
-         * Construimos una lista para mostrar
-         * exactamente qué recibió el servidor.
-         */
-        const listaArchivos =
-          archivosGuardados
-            .map(archivo => `
-              <li>
-                ${archivo.ruta}
-                (${archivo.tamaño} bytes)
-              </li>
-            `)
-            .join("");
-
-        res.writeHead(200, {
-          "Content-Type": "text/html; charset=utf-8"
-        });
-
-        res.end(`
-          <!DOCTYPE html>
-
-          <html>
-            <head>
-              <meta charset="UTF-8">
-              <title>Archivos recibidos</title>
-            </head>
-
-            <body>
-
-              <h1>Archivos recibidos correctamente</h1>
-
-              <p>
-                Se recibieron
-                <strong>
-                  ${archivosGuardados.length}
-                </strong>
-                archivo(s).
-              </p>
-
-              <h2>Estructura recibida:</h2>
-
-              <ul>
-                ${listaArchivos}
-              </ul>
-
-              <p>
-                Los archivos fueron guardados
-                temporalmente en:
-              </p>
-
-              <code>uploads/</code>
 
               <br><br>
 
-              <a href="/">Volver</a>
 
-            </body>
-          </html>
-        `);
+              <button type="submit">
+                Enviar proyecto
+              </button>
+
+            </form>
+
+          </body>
+
+        </html>
+        `
+      );
+    }
+
+
+    // ========================================================
+    // PROBAR GITHUB
+    // ========================================================
+
+    if (
+      req.method === "GET" &&
+      req.url === "/github/test"
+    ) {
+
+      try {
+
+        const usuario =
+          await obtenerUsuarioGitHub();
+
+
+        return responderHTML(
+          res,
+          200,
+          `
+          <h1>
+            Conexión con GitHub correcta
+          </h1>
+
+          <p>
+            Usuario autenticado:
+            <strong>
+              ${usuario.login}
+            </strong>
+          </p>
+
+          <p>
+            GitHub respondió correctamente.
+          </p>
+
+          <br>
+
+          <a href="/">
+            Volver
+          </a>
+          `
+        );
 
       } catch (error) {
 
-        console.error(
-          "Error procesando archivos:",
-          error
-        );
-
-        res.writeHead(500, {
-          "Content-Type": "text/html; charset=utf-8"
-        });
-
-        res.end(`
-          <h1>Error procesando archivos</h1>
+        return responderHTML(
+          res,
+          500,
+          `
+          <h1>
+            Error de conexión con GitHub
+          </h1>
 
           <p>
             ${error.message}
@@ -458,22 +594,728 @@ const server = http.createServer((req, res) => {
 
           <br>
 
-          <a href="/">Volver</a>
-        `);
+          <a href="/">
+            Volver
+          </a>
+          `
+        );
       }
-    });
+    }
 
-    return;
+
+    // ========================================================
+    // RECIBIR Y ENVIAR PROYECTO
+    // ========================================================
+
+    if (
+      req.method === "POST" &&
+      req.url === "/upload"
+    ) {
+
+      const chunks = [];
+
+
+      req.on(
+        "data",
+        chunk => {
+          chunks.push(chunk);
+        }
+      );
+
+
+      req.on(
+        "end",
+        async () => {
+
+          try {
+
+            const datos =
+              Buffer.concat(chunks);
+
+
+            const contentType =
+              req.headers["content-type"];
+
+
+            if (
+              !contentType ||
+              !contentType.includes(
+                "multipart/form-data"
+              )
+            ) {
+
+              return responderHTML(
+                res,
+                400,
+                `
+                <h1>
+                  Error
+                </h1>
+
+                <p>
+                  La solicitud no contiene
+                  archivos válidos.
+                </p>
+
+                <a href="/">
+                  Volver
+                </a>
+                `
+              );
+            }
+
+
+            /*
+             * Obtener boundary.
+             */
+
+            const match =
+              contentType.match(
+                /boundary=(?:"([^"]+)"|([^;]+))/
+              );
+
+
+            if (!match) {
+
+              return responderHTML(
+                res,
+                400,
+                `
+                <h1>
+                  Error
+                </h1>
+
+                <p>
+                  No se encontró el límite
+                  del formulario.
+                </p>
+
+                <a href="/">
+                  Volver
+                </a>
+                `
+              );
+            }
+
+
+            const boundary =
+              Buffer.from(
+                "--" +
+                (match[1] || match[2])
+              );
+
+
+            /*
+             * Separar las partes multipart.
+             */
+
+            const partes = [];
+
+            let posicion = 0;
+
+
+            while (true) {
+
+              const encontrada =
+                datos.indexOf(
+                  boundary,
+                  posicion
+                );
+
+
+              if (encontrada === -1) {
+                break;
+              }
+
+
+              partes.push(
+                datos.slice(
+                  posicion,
+                  encontrada
+                )
+              );
+
+
+              posicion =
+                encontrada +
+                boundary.length;
+            }
+
+
+            /*
+             * Carpeta temporal.
+             */
+
+            const carpetaUploads =
+              path.join(
+                __dirname,
+                "uploads"
+              );
+
+
+            fs.mkdirSync(
+              carpetaUploads,
+              {
+                recursive: true
+              }
+            );
+
+
+            const archivos = [];
+
+
+            // =================================================
+            // PROCESAR ARCHIVOS
+            // =================================================
+
+            for (
+              const parte of partes
+            ) {
+
+              const encabezadoFin =
+                parte.indexOf(
+                  Buffer.from(
+                    "\r\n\r\n"
+                  )
+                );
+
+
+              if (
+                encabezadoFin === -1
+              ) {
+                continue;
+              }
+
+
+              const encabezados =
+                parte
+                  .slice(
+                    0,
+                    encabezadoFin
+                  )
+                  .toString();
+
+
+              if (
+                !encabezados.includes(
+                  'name="archivo"'
+                )
+              ) {
+                continue;
+              }
+
+
+              const nombreMatch =
+                encabezados.match(
+                  /filename="([^"]*)"/
+                );
+
+
+              if (!nombreMatch) {
+                continue;
+              }
+
+
+              let nombre =
+                nombreMatch[1];
+
+
+              if (!nombre) {
+                continue;
+              }
+
+
+              /*
+               * Normalizar separadores.
+               */
+
+              nombre =
+                nombre.replace(
+                  /\\/g,
+                  "/"
+                );
+
+
+              nombre =
+                nombre.replace(
+                  /^\/+/,
+                  ""
+                );
+
+
+              /*
+               * Evitar rutas peligrosas.
+               */
+
+              const segmentos =
+                nombre
+                  .split("/")
+                  .filter(
+                    segmento =>
+                      segmento &&
+                      segmento !== "." &&
+                      segmento !== ".."
+                  );
+
+
+              if (
+                segmentos.length === 0
+              ) {
+                continue;
+              }
+
+
+              const rutaRelativa =
+                segmentos.join("/");
+
+
+              const rutaLocal =
+                path.join(
+                  carpetaUploads,
+                  ...segmentos
+                );
+
+
+              /*
+               * Seguridad:
+               * impedir salir de uploads.
+               */
+
+              const comprobacion =
+                path.relative(
+                  carpetaUploads,
+                  rutaLocal
+                );
+
+
+              if (
+                comprobacion.startsWith(
+                  ".."
+                ) ||
+                path.isAbsolute(
+                  comprobacion
+                )
+              ) {
+                continue;
+              }
+
+
+              /*
+               * Extraer contenido.
+               */
+
+              let contenido =
+                parte.slice(
+                  encabezadoFin + 4
+                );
+
+
+              /*
+               * Quitar CRLF final.
+               */
+
+              if (
+                contenido.length >= 2 &&
+                contenido
+                  .slice(-2)
+                  .toString() ===
+                    "\r\n"
+              ) {
+
+                contenido =
+                  contenido.slice(
+                    0,
+                    -2
+                  );
+              }
+
+
+              /*
+               * Crear carpetas.
+               */
+
+              fs.mkdirSync(
+                path.dirname(
+                  rutaLocal
+                ),
+                {
+                  recursive: true
+                }
+              );
+
+
+              /*
+               * Guardar temporalmente.
+               */
+
+              fs.writeFileSync(
+                rutaLocal,
+                contenido
+              );
+
+
+              archivos.push({
+                ruta:
+                  rutaRelativa,
+
+                local:
+                  rutaLocal,
+
+                contenido:
+                  contenido
+              });
+            }
+
+
+            if (
+              archivos.length === 0
+            ) {
+
+              return responderHTML(
+                res,
+                400,
+                `
+                <h1>
+                  No se recibieron archivos
+                </h1>
+
+                <p>
+                  No encontramos archivos
+                  válidos.
+                </p>
+
+                <a href="/">
+                  Volver
+                </a>
+                `
+              );
+            }
+
+
+            // =================================================
+            // OBTENER NOMBRE DEL PROYECTO
+            // =================================================
+
+            const nombreRepositorio =
+              obtenerNombreProyecto(
+                archivos
+              );
+
+
+            // =================================================
+            // USUARIO GITHUB
+            // =================================================
+
+            const usuario =
+              await obtenerUsuarioGitHub();
+
+
+            const owner =
+              usuario.login;
+
+
+            // =================================================
+            // CREAR / REUTILIZAR REPOSITORIO
+            // =================================================
+
+            const repositorio =
+              await obtenerOCrearRepositorio(
+                owner,
+                nombreRepositorio
+              );
+
+
+            const branch =
+              repositorio.default_branch ||
+              "main";
+
+
+            // =================================================
+            // SUBIR ARCHIVOS
+            // =================================================
+
+            const resultados = [];
+
+
+            /*
+             * IMPORTANTE:
+             *
+             * Los archivos se suben uno por uno,
+             * no simultáneamente.
+             */
+
+            for (
+              const archivo of archivos
+            ) {
+
+              const resultado =
+                await subirArchivoGitHub(
+                  owner,
+
+                  repositorio.name,
+
+                  archivo.ruta,
+
+                  archivo.contenido,
+
+                  branch
+                );
+
+
+              resultados.push(
+                resultado
+              );
+            }
+
+
+            // =================================================
+            // EJECUTAR ACTION
+            // =================================================
+
+            const action =
+              await ejecutarAction(
+                owner,
+
+                repositorio.name,
+
+                COMPILER_WORKFLOW,
+
+                branch
+              );
+
+
+            // =================================================
+            // LIMPIAR TEMPORAL
+            // =================================================
+
+            /*
+             * Solo eliminamos uploads DESPUÉS
+             * de terminar el envío a GitHub.
+             *
+             * Esto NO toca el archivo original
+             * del móvil o PC.
+             */
+
+            fs.rmSync(
+              carpetaUploads,
+              {
+                recursive: true,
+                force: true
+              }
+            );
+
+
+            // =================================================
+            // RESULTADO
+            // =================================================
+
+            return responderHTML(
+              res,
+              200,
+              `
+              <!DOCTYPE html>
+
+              <html>
+
+                <head>
+
+                  <meta charset="UTF-8">
+
+                  <title>
+                    Proyecto enviado
+                  </title>
+
+                </head>
+
+
+                <body>
+
+                  <h1>
+                    Proyecto enviado correctamente
+                  </h1>
+
+
+                  <p>
+
+                    Repositorio:
+
+                    <strong>
+                      ${repositorio.full_name}
+                    </strong>
+
+                  </p>
+
+
+                  <p>
+
+                    Archivos enviados:
+
+                    <strong>
+                      ${archivos.length}
+                    </strong>
+
+                  </p>
+
+
+                  <p>
+
+                    Repositorio:
+
+                    ${
+                      repositorio.creadoAhora
+                        ? "creado ahora"
+                        : "ya existía"
+                    }
+
+                  </p>
+
+
+                  <p>
+
+                    GitHub Action:
+
+                    <strong>
+
+                      ${
+                        action.ejecutada
+                          ? "solicitada correctamente"
+                          : "no ejecutada todavía"
+                      }
+
+                    </strong>
+
+                  </p>
+
+
+                  ${
+                    !action.ejecutada
+                      ? `
+                        <p>
+                          Motivo:
+                          ${action.mensaje}
+                        </p>
+
+                        <p>
+                          Revisá que exista el workflow
+                          <strong>
+                            ${COMPILER_WORKFLOW}
+                          </strong>
+                          y que acepte
+                          <code>workflow_dispatch</code>.
+                        </p>
+                      `
+                      : ""
+                  }
+
+
+                  <p>
+
+                    <a
+                      href="${repositorio.html_url}"
+                      target="_blank"
+                    >
+                      Abrir repositorio
+                    </a>
+
+                  </p>
+
+
+                  <br>
+
+
+                  <a href="/">
+                    Volver
+                  </a>
+
+                </body>
+
+              </html>
+              `
+            );
+
+
+          } catch (error) {
+
+            console.error(
+              "Error procesando proyecto:",
+              error
+            );
+
+
+            return responderHTML(
+              res,
+              500,
+              `
+              <h1>
+                Error procesando el proyecto
+              </h1>
+
+              <p>
+                ${error.message}
+              </p>
+
+              <p>
+                Los archivos originales
+                de tu dispositivo
+                <strong>
+                  no fueron eliminados
+                </strong>.
+              </p>
+
+              <br>
+
+              <a href="/">
+                Volver
+              </a>
+              `
+            );
+          }
+        }
+      );
+
+
+      return;
+    }
+
+
+    // ========================================================
+    // 404
+    // ========================================================
+
+    responderHTML(
+      res,
+      404,
+      `
+      <h1>
+        404
+      </h1>
+
+      <p>
+        Página no encontrada.
+      </p>
+
+      <a href="/">
+        Volver
+      </a>
+      `
+    );
+
   }
+);
 
-  // Página inexistente
-  res.writeHead(404, {
-    "Content-Type": "text/plain; charset=utf-8"
-  });
 
-  res.end("Página no encontrada.");
-});
+// ============================================================
+// SERVIDOR
+// ============================================================
 
-server.listen(PORT, () => {
-  console.log("Servidor iniciado en el puerto " + PORT);
-});
+server.listen(
+  PORT,
+  () => {
+
+    console.log(
+      "Servidor iniciado en el puerto " +
+      PORT
+    );
+
+  }
+);
