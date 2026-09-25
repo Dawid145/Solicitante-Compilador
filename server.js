@@ -38,7 +38,13 @@ const server = http.createServer((req, res) => {
           <h2>Subir un archivo</h2>
 
           <form action="/upload" method="POST" enctype="multipart/form-data">
-            <input type="file" name="archivo" required>
+            <input
+  type="file"
+  name="archivo"
+  multiple
+  webkitdirectory
+  directory
+>
             <br><br>
             <button type="submit">Enviar archivo</button>
           </form>
