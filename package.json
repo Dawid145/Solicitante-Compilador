@@ -1,0 +1,9 @@
+{
+  "name": "solicitante-compilador",
+  "version": "1.0.0",
+  "description": "Aplicación web mínima",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
